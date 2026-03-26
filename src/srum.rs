@@ -99,6 +99,20 @@ pub struct SrumDatabase {
     id_map: HashMap<u32, String>,
 }
 
+/// Read the ESE database page size from the file header (offset 0xEC).
+fn read_ese_page_size(path: &Path) -> Result<usize> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(path).context("Could not open database file")?;
+    let mut header = [0u8; 0xF0];
+    f.read_exact(&mut header)
+        .context("Could not read database header")?;
+    let page_size = u32::from_le_bytes([header[0xEC], header[0xED], header[0xEE], header[0xEF]]);
+    if page_size == 0 || !page_size.is_power_of_two() || !(4096..=32768).contains(&page_size) {
+        bail!("Unexpected ESE page size {} in database header", page_size);
+    }
+    Ok(page_size as usize)
+}
+
 impl SrumDatabase {
     /// Open a SRUM database file (must be a copy, not the live locked file).
     pub fn open(db_path: &Path) -> Result<Self> {
@@ -107,6 +121,10 @@ impl SrumDatabase {
             .encode_utf16()
             .chain(std::iter::once(0))
             .collect();
+
+        // Read page size from ESE database header (offset 0xEC, 4 bytes LE)
+        let page_size = read_ese_page_size(db_path)?;
+        eprintln!("Detected ESE page size: {} bytes", page_size);
 
         unsafe {
             let mut instance = JET_INSTANCE(0);
@@ -118,20 +136,19 @@ impl SrumDatabase {
                 "JetCreateInstanceW",
             )?;
 
-            // Set page size to 32KB (SRUM uses this since Win10 1903+, older used 4KB)
-            // Try 32KB first; if attach fails, try 4KB
+            // Set page size (must be set on the instance before JetInit)
             jet_check(
                 JetSetSystemParameterW(
                     &mut instance,
                     JET_SESID(0),
                     JET_PARAM_DATABASE_PAGE_SIZE,
-                    32768,
+                    page_size,
                     std::ptr::null(),
                 ),
                 "JetSetSystemParameter(PageSize)",
             )?;
 
-            // Disable recovery (we're read-only)
+            // Disable recovery (we're read-only on a copy)
             let off: Vec<u16> = "0\0".encode_utf16().collect();
             jet_check(
                 JetSetSystemParameterW(
@@ -155,71 +172,10 @@ impl SrumDatabase {
             )?;
 
             // Attach database read-only
-            let attach_result = JetAttachDatabaseW(sesid, db_wide.as_ptr(), JET_bitDbReadOnly);
-            if attach_result < 0 {
-                // Might need different page size - try cleanup and retry with 4KB
-                let _ = JetEndSession(sesid, 0);
-                let _ = JetTerm(instance);
-
-                // Retry with 4KB page size
-                let mut instance2 = JET_INSTANCE(0);
-                jet_check(
-                    JetCreateInstanceW(&mut instance2, Some(instance_name.as_ptr())),
-                    "JetCreateInstanceW (retry)",
-                )?;
-                jet_check(
-                    JetSetSystemParameterW(
-                        &mut instance2,
-                        JET_SESID(0),
-                        JET_PARAM_DATABASE_PAGE_SIZE,
-                        4096,
-                        std::ptr::null(),
-                    ),
-                    "JetSetSystemParameter(PageSize 4K)",
-                )?;
-                jet_check(
-                    JetSetSystemParameterW(
-                        &mut instance2,
-                        JET_SESID(0),
-                        JET_PARAM_RECOVERY,
-                        0,
-                        off.as_ptr(),
-                    ),
-                    "JetSetSystemParameter(Recovery 4K)",
-                )?;
-                jet_check(JetInit(Some(&mut instance2)), "JetInit (retry)")?;
-
-                let mut sesid2 = JET_SESID(0);
-                jet_check(
-                    JetBeginSessionW(instance2, &mut sesid2, None, None),
-                    "JetBeginSessionW (retry)",
-                )?;
-                jet_check(
-                    JetAttachDatabaseW(sesid2, db_wide.as_ptr(), JET_bitDbReadOnly),
-                    "JetAttachDatabaseW (4K page)",
-                )?;
-
-                let mut dbid2: u32 = 0;
-                jet_check(
-                    JetOpenDatabaseW(
-                        sesid2,
-                        db_wide.as_ptr(),
-                        None,
-                        &mut dbid2,
-                        JET_bitDbReadOnly,
-                    ),
-                    "JetOpenDatabaseW (4K)",
-                )?;
-
-                let mut db = SrumDatabase {
-                    instance: instance2,
-                    sesid: sesid2,
-                    dbid: dbid2,
-                    id_map: HashMap::new(),
-                };
-                db.load_id_map()?;
-                return Ok(db);
-            }
+            jet_check(
+                JetAttachDatabaseW(sesid, db_wide.as_ptr(), JET_bitDbReadOnly),
+                "JetAttachDatabaseW",
+            )?;
 
             // Open database
             let mut dbid: u32 = 0;
@@ -285,14 +241,10 @@ impl SrumDatabase {
                     .and_then(|id| self.retrieve_u32(tableid, id))
                     .unwrap_or(0);
 
-                let value = if id_type == 3 {
-                    // SID - convert binary to string SID
-                    blob.as_ref()
-                        .map(|b| binary_sid_to_string(b))
-                        .unwrap_or_default()
-                } else {
-                    // App name or other blob - try UTF-16 then UTF-8
-                    blob.as_ref().map(|b| blob_to_string(b)).unwrap_or_default()
+                let value = match &blob {
+                    Some(b) if id_type == 3 || is_binary_sid(b) => binary_sid_to_string(b),
+                    Some(b) => bytes_to_string(b),
+                    None => String::new(),
                 };
 
                 if !value.is_empty() {
@@ -304,6 +256,7 @@ impl SrumDatabase {
 
             let _ = JetCloseTable(self.sesid, tableid);
         }
+        eprintln!("Loaded {} ID map entries", self.id_map.len());
         Ok(())
     }
 
@@ -377,7 +330,7 @@ impl SrumDatabase {
         }
     }
 
-    /// Retrieve a string (ASCII) from a column.
+    /// Retrieve a string from a column, auto-detecting UTF-16 vs UTF-8.
     fn retrieve_string(&self, tableid: JET_TABLEID, column_id: u32) -> Option<String> {
         let mut buf = [0u8; 512];
         let mut actual: u32 = 0;
@@ -393,13 +346,8 @@ impl SrumDatabase {
                 None,
             );
             if err >= 0 && actual > 0 {
-                let len = actual as usize;
-                // Try ASCII first
-                Some(
-                    String::from_utf8_lossy(&buf[..len])
-                        .trim_end_matches('\0')
-                        .to_string(),
-                )
+                let data = &buf[..actual as usize];
+                Some(bytes_to_string(data))
             } else {
                 None
             }
@@ -632,12 +580,19 @@ impl SrumDatabase {
                 for col in &columns {
                     let mut val = self.retrieve_column_value(tableid, col);
                     // Resolve AppId and UserId through id_map
-                    if (col.name == "AppId" || col.name == "UserId")
-                        && col.col_type == 4
-                        && let ColumnValue::Long(id) = &val
-                        && let Some(resolved) = self.id_map.get(&(*id as u32))
-                    {
-                        val = ColumnValue::Text(resolved.clone());
+                    if col.name == "AppId" || col.name == "UserId" {
+                        let numeric_id = match &val {
+                            ColumnValue::Long(v) => Some(*v as u32),
+                            ColumnValue::UnsignedLong(v) => Some(*v),
+                            ColumnValue::Short(v) => Some(*v as u32),
+                            ColumnValue::LongLong(v) => Some(*v as u32),
+                            _ => None,
+                        };
+                        if let Some(id) = numeric_id
+                            && let Some(resolved) = self.id_map.get(&id)
+                        {
+                            val = ColumnValue::Text(resolved.clone());
+                        }
                     }
                     row.push(val);
                 }
@@ -651,11 +606,9 @@ impl SrumDatabase {
         Ok((col_names, rows))
     }
 
-    /// List all tables in the database.
-    pub fn list_tables(&self) -> Result<Vec<String>> {
+    /// List all tables in the database with row counts.
+    pub fn list_tables(&self) -> Result<Vec<(String, usize)>> {
         let mut tables = Vec::new();
-        // Use JetGetObjectInfoW or iterate known tables
-        // For simplicity, try to open known SRUM tables
         let known = [
             ENERGY_USAGE_TABLE,
             ENERGY_USAGE_LT_TABLE,
@@ -679,7 +632,13 @@ impl SrumDatabase {
                     &mut tableid,
                 );
                 if err >= 0 {
-                    tables.push(name.to_string());
+                    let mut count: usize = 0;
+                    let mut move_err = JetMove(self.sesid, tableid, JET_MOVE_FIRST, 0);
+                    while move_err >= 0 {
+                        count += 1;
+                        move_err = JetMove(self.sesid, tableid, JET_MOVE_NEXT, 0);
+                    }
+                    tables.push((name.to_string(), count));
                     let _ = JetCloseTable(self.sesid, tableid);
                 }
             }
@@ -715,6 +674,18 @@ impl Drop for SrumDatabase {
     }
 }
 
+/// Check if a byte slice looks like a binary SID (starts with revision=1, has valid structure).
+fn is_binary_sid(data: &[u8]) -> bool {
+    if data.len() < 8 {
+        return false;
+    }
+    let revision = data[0];
+    let sub_count = data[1] as usize;
+    // SID revision is always 1, sub-authority count should be reasonable,
+    // and total length should match: 8 + sub_count * 4
+    revision == 1 && sub_count <= 15 && data.len() >= 8 + sub_count * 4
+}
+
 /// Convert a binary SID to its string representation (S-1-5-21-...).
 fn binary_sid_to_string(data: &[u8]) -> String {
     if data.len() < 8 {
@@ -746,21 +717,25 @@ fn binary_sid_to_string(data: &[u8]) -> String {
     sid
 }
 
-/// Convert a blob to a string, trying UTF-16LE first, then UTF-8.
-fn blob_to_string(data: &[u8]) -> String {
-    // Try UTF-16LE (common for Windows strings in SRUM)
-    if data.len() >= 2 && data.len().is_multiple_of(2) {
+/// Smart string decode: if the data looks like UTF-16LE (has null bytes in the
+/// pattern of UTF-16 ASCII), decode as UTF-16. Otherwise fall back to UTF-8.
+fn bytes_to_string(data: &[u8]) -> String {
+    // Heuristic: if every other byte is 0x00 and the others are printable ASCII,
+    // it's UTF-16LE.
+    if data.len() >= 2
+        && data.len().is_multiple_of(2)
+        && data.chunks_exact(2).all(|c| c[1] == 0 || c[0] != 0)
+        && data.iter().step_by(2).any(|&b| b > 0x20 && b < 0x7F)
+        && data.iter().skip(1).step_by(2).all(|&b| b == 0)
+    {
         let u16s: Vec<u16> = data
             .chunks_exact(2)
             .map(|c| u16::from_le_bytes([c[0], c[1]]))
             .collect();
-        let s = String::from_utf16_lossy(&u16s);
-        let s = s.trim_end_matches('\0');
-        if !s.is_empty() && s.chars().all(|c| !c.is_control() || c == '\n' || c == '\r') {
-            return s.to_string();
-        }
+        return String::from_utf16_lossy(&u16s)
+            .trim_end_matches('\0')
+            .to_string();
     }
-    // Fall back to UTF-8
     String::from_utf8_lossy(data)
         .trim_end_matches('\0')
         .to_string()

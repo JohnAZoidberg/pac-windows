@@ -259,8 +259,13 @@ fn cmd_srum(db_path: PathBuf, table: String, csv: bool, limit: Option<usize>) ->
 
     if table == "list" {
         println!("\nAvailable tables:");
-        for t in db.list_tables()? {
-            println!("  {} ({})", t, srum::table_friendly_name(&t));
+        for (guid, count) in db.list_tables()? {
+            println!(
+                "  {:<50} {:>6} rows  ({})",
+                guid,
+                count,
+                srum::table_friendly_name(&guid)
+            );
         }
         return Ok(());
     }
